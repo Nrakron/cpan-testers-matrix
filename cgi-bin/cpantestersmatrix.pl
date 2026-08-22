@@ -4,7 +4,7 @@
 #
 # Author: Slaven Rezic
 #
-# Copyright (C) 2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022 Slaven Rezic. All rights reserved.
+# Copyright (C) 2007-2026 Slaven Rezic. All rights reserved.
 # This program is free software; you can redistribute it and/or
 # modify it under the same terms as Perl itself.
 #
@@ -18,7 +18,7 @@ use 5.010; # defined-or
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = '2.50';
+$VERSION = '2.71';
 
 use vars qw($UA);
 
@@ -26,6 +26,15 @@ use FindBin;
 my $realbin;
 BEGIN { ($realbin) = $FindBin::RealBin =~ m{^(.*)$} } # untaint it
 use lib $realbin;
+
+my $title; BEGIN { $title = "CPAN Testers Matrix" }
+
+BEGIN {
+    if ($ENV{BOTCHECKER_JS_ENABLED}) {
+	require Botchecker_js;
+	Botchecker_js::antibot($title);
+    }
+}
 
 use CGI qw(escapeHTML);
 use CGI::Carp qw();
@@ -56,6 +65,7 @@ sub require_deserializer_dist ();
 sub require_deserializer_author ();
 sub require_yaml ();
 sub require_json ();
+sub require_ndjson ();
 sub beta_html ();
 sub trim ($);
 sub get_config ($);
@@ -68,12 +78,7 @@ sub _reusing_cache_msg ($);
 my $cache_days = 1/8;
 my $ua_timeout = 30;
 
-my $current_stable_perl = "5.36.0"; # please always end with ".0"
-
-#use constant FILEFMT_AUTHOR => 'yaml';
-use constant FILEFMT_AUTHOR => 'json';
-#use constant FILEFMT_DIST   => 'yaml';
-use constant FILEFMT_DIST   => 'json';
+my $current_stable_perl = "5.44.0"; # please always end with ".0"
 
 use constant USE_JQUERY_TABLESORTER => 1;
 
@@ -92,28 +97,50 @@ if (!$ENV{CPANTESTERSMATRIX_CONFIG_FILE}) {
 }
 my $config_yml = "$realbin/$cpantestersmatrix_config_file";
 
+return 1 if caller;
+
+my $filefmt_author = get_config('filefmt_author') || 'json'; # json, ndson, yaml
+my $filefmt_dist   = get_config('filefmt_dist')   || 'json'; # json, ndson, yaml
+
+use constant APP_MODE_REGULAR    => 0;
+use constant APP_MODE_LOGTXT    => 1;
+use constant APP_MODE_NDJSONAPI => 2;
+
 # Two things:
 # - if set, then the "log.txt" view is enabled, with
 #   some changes in UI and caching
 # - and this is the directory where the json files
 #   are stored
 my $static_dist_dir = get_config('static_dist_dir');
-my $is_log_txt_view;
 if ($static_dist_dir) {
-    $is_log_txt_view = 1;
     $cache_days = 5/1440;
 }
+my $ndjson_append_url = get_config('ndjson_append_url');
+if (defined $ndjson_append_url) {
+    if (!defined $static_dist_dir) {
+	die "If ndjson_append_url is defined in the configuration file, then static_dist_dir must also be defined";
+    }
+    if ($filefmt_dist ne 'ndjson') {
+	die "If ndjson_append_url is defined in the configuration file, then filefmt_dist needs to be set to 'ndjson'";
+    }
+    $ua_timeout = 180;
+}
+
+my $app_mode =
+    defined $ndjson_append_url ? APP_MODE_NDJSONAPI :
+    $static_dist_dir           ? APP_MODE_LOGTXT :
+    APP_MODE_REGULAR;
 
 my $cache_root = (get_config("cache_root") || "/tmp/cpantesters_cache") . "_" . $<;
 mkdir $cache_root, 0755 if !-d $cache_root;
 my $dist_cache = "$cache_root/dist";
-if (FILEFMT_DIST eq 'json') {
-    $dist_cache .= '_json';
+if ($filefmt_dist ne 'yaml') {
+    $dist_cache .= '_' . $filefmt_dist;
 }
 mkdir $dist_cache, 0755 if !-d $dist_cache;
 my $author_cache = "$cache_root/author";
-if (FILEFMT_AUTHOR eq 'json') {
-    $author_cache .= '_json';
+if ($filefmt_author ne 'yaml') {
+    $author_cache .= '_' . $filefmt_author;
 }
 mkdir $author_cache, 0755 if !-d $author_cache;
 my $meta_cache = "$cache_root/meta";
@@ -130,12 +157,11 @@ if (!-e $amendments_yml) {
     }
 }
 (my $amendments_st = $amendments_yml) =~ s{\.yml$}{};
-$amendments_st .= "." . $<;
+$amendments_st .= "_v2." . $<;
 $amendments_st = add_serializer_suffix($amendments_st);
 my $amendments;
 
 # XXX hmm, some globals ...
-my $title = "CPAN Testers Matrix";
 
 my $q = CGI->new;
 if (eval { require Botchecker; 1 }) {
@@ -157,7 +183,8 @@ my $ct_domain = $new_ct_domain;
 my $ct_link = "http://$ct_domain";
 my $dist_bugtracker_url;
 #my $report_rooturl = "http://nntp.x.perl.org/group/perl.cpan.testers/";
-my $report_rooturl = "http://www.cpantesters.org/cpan/report/";
+#my $report_rooturl = "http://www.cpantesters.org/cpan/report/";
+my $report_rooturl = "https://www.cpantesters.org/cpan/report/";
 my $table;
 my $tables;
 my $cachefile;
@@ -224,7 +251,9 @@ my %prefs = do {
     }
 
     print $q->header(
+	-type => 'text/html; charset=utf-8',
 	($do_set_cookie ? (-cookie => [$cookie]) : ()),
+	(@MyCGI::TAGS ? (-x_tag => join(',', @MyCGI::TAGS)) : ()),
 	-expires => (
 		     $edit_prefs            ? 'now' : # prefs page
 		     $q->query_string eq '' ? '+1d' : # home page
@@ -237,6 +266,7 @@ my %prefs = do {
 
 my $first_report_epoch;
 my $last_report_epoch;
+my $excluded_old_devel;
 
 if ((defined $dist   && $dist   =~ /[<>&]/) ||
     (defined $author && $author =~ /[<>&]/)) {
@@ -268,7 +298,7 @@ if ((defined $dist   && $dist   =~ /[<>&]/) ||
 	    my($perl, $patch) = eval { get_perl_and_patch($rec) };
 	    next if !$perl;
 	    next if defined $want_perl && $perl ne $want_perl;
-	    next if $prefs{exclude_old_devel} && is_old_devel_perl($perl);
+	    do { $excluded_old_devel = 1; next } if $prefs{exclude_old_devel} && is_old_devel_perl($perl);
 	    next if defined $want_os && ($rec->{osname}//'') ne $want_os;
 	    push @reports, $rec;
 	    $rec->{patch} = $patch;
@@ -307,7 +337,7 @@ if ((defined $dist   && $dist   =~ /[<>&]/) ||
 	    my $action_comment_html = $rec->{action_comment}||"";
 	    $action_comment_html =~ s{(https?://\S+)}{<a href="$1">$1</a>}g; # simple-minded href-ify
 	    my($display_id, $report_url);
-	    if (!$is_log_txt_view ||
+	    if ($app_mode != APP_MODE_LOGTXT ||
 		$rec->{fulldate} ge "2017-08-13" # since the switch to the new cpantesters API report linking on the log.txt view is possible
 	       ) {
 		my $id = ($rec->{guid} || $rec->{id}); # prefer guid over id for linking
@@ -382,7 +412,7 @@ if ((defined $dist   && $dist   =~ /[<>&]/) ||
 	}
 	$table->setSectionColHead('tbody', 0, 1, 1);
 	$dist_title = ": $dist $dist_version";
-	$ct_link = "http://$ct_domain/show/$dist.html#$dist-$dist_version";
+	$ct_link = "https://$ct_domain/show/$dist.html#$dist-$dist_version";
     };
     $error = $@ if $@;
 } elsif ($author) {
@@ -424,6 +454,7 @@ if ((defined $dist   && $dist   =~ /[<>&]/) ||
 	$table = $r->{table};
 	$ct_link = $r->{ct_link};
 	$dist_title = ": $r->{title}";
+	$excluded_old_devel = $r->{excluded_old_devel};
     };
     $error = $@ if $@;
 }
@@ -431,6 +462,7 @@ if ((defined $dist   && $dist   =~ /[<>&]/) ||
 my $deprecated_string = $is_deprecated ? " (DEPRECATED)" : '';
 my $latest_distribution_string = $is_latest_version ? " (latest distribution)" : "";
 
+binmode STDOUT, ':encoding(utf-8)';
 print <<EOF;
 <html>
  <head><title>$title$dist_title</title>
@@ -440,6 +472,17 @@ print <<EOF;
   <link rel="apple-touch-icon" sizes="114x114" href="images/cpantesters_icon_114.png" />
   <link rel="search" href="/opensearch.xml" type="application/opensearchdescription+xml" title="CPAN Testers Matrix">
   <meta name="ROBOTS" content="INDEX, NOFOLLOW" />
+EOF
+# documented by google -- both page-read-aloud and translate are not useful here
+print <<EOF;
+  <meta name="google" content="nopagereadaloud">
+  <meta name="googlebot" content="notranslate">
+EOF
+# undocumented, found in stackoverflow
+print <<EOF;
+  <meta name="google" content="notranslate">
+EOF
+print <<EOF;
   <style type="text/css"><!--
 EOF
 print $stylesheets{ $prefs{stylesheet} }->{fun}->();
@@ -520,7 +563,7 @@ print qq{  var js_debug = } . (JS_DEBUG ? 'true' : 'false') . ";\n";
 print <<EOF;
   // End script hiding -->
   </script>
-  <script type="text/javascript" src="matrix_cpantesters.js?v=20150419"></script>
+  <script type="text/javascript" src="matrix_cpantesters.js?v=20250502"></script>
 EOF
 if ($reports && USE_JQUERY_TABLESORTER) {
     print <<'EOF';
@@ -587,7 +630,7 @@ if ($cachefile) {
 }
 print qq{<body onload="} .
     ($prefs{steal_focus} ? qq{focus_first(); } : '') .
-    ($downtime_teaser ? qq{rewrite_server_datetime(); } : '') .
+    #($downtime_teaser ? qq{rewrite_server_datetime(); } : '') .
     ($first_report_epoch ? qq{new DynamicDate($first_report_epoch, 'first_report_date', {no_seconds:true, debug:js_debug}); } : '') .
     ($last_report_epoch  ? qq{new DynamicDate($last_report_epoch,  'last_report_date',  {no_seconds:true, debug:js_debug}); } : '') .
     ($cachefile_time     ? qq{new DynamicDate($cachefile_time,     'cachedate',         {no_seconds:true, debug:js_debug}); } : '') .
@@ -607,9 +650,9 @@ print qq{<body onload="} .
     print "<h1>$h1_innerhtml</h1>\n";
 }
 
-if ($is_log_txt_view) {
+if ($app_mode == APP_MODE_LOGTXT) {
     print <<EOF;
-<div class="warn">NOTE: This is the <a href="http://metabase.cpantesters.org/tail/log.txt">log.txt</a> view <span class="sml">(<a href="http://www.nntp.perl.org/group/perl.cpan.testers.discuss/2012/11/msg2906.html">What's this?</a>)</span></div><br/>
+<div class="warn">NOTE: This is the <a href="https://metabase.cpantesters.org/tail/log.txt">log.txt</a> view <span class="sml">(<a href="https://www.nntp.perl.org/group/perl.cpan.testers.discuss/2012/11/msg2906.html">What's this?</a>)</span></div><br/>
 EOF
 }
 
@@ -676,6 +719,7 @@ EOF
 
     if ($table) {
 	$table->print;
+	excluded_old_devel_notice() if $excluded_old_devel;
     }
 
     if (USE_JQUERY_TABLESORTER) {
@@ -700,7 +744,9 @@ EOF
 	for my $r (@$tables) {
 	    print qq{<h2><a href="$r->{ct_link}" name="$r->{anchor}">$r->{title}</a></h2>};
 	    print $r->{table};
+	    excluded_old_devel_notice() if $r->{excluded_old_devel};
 	}
+
     }
 
     print <<EOF;
@@ -723,6 +769,7 @@ EOF
 
     if ($table) {
 	$table->print;
+	excluded_old_devel_notice() if $excluded_old_devel;
     }
 
     if ($table) {
@@ -838,41 +885,17 @@ if ($cachefile) {
 EOF
 }
 
-my $sponsor_blurb = "";
-use Sys::Hostname ();
-if (Sys::Hostname::hostname eq "ds8143") {
-    $sponsor_blurb = <<'EOF'
-  <style>
-    .webfusion {
-      background-color: #000;
-      color: #fff;
-      background: -moz-linear-gradient(center top , #020802 0%, #282A28 100%) repeat scroll 0 0 rgba(0, 0, 0, 0);
-      border-bottom: 4px solid #4FAB45;
-      border-top: 2px solid #4FAB45;
-      margin-top:1ex;
-      padding-left:1em;
-      padding-top:1ex;
-      padding-bottom:1ex;
-    }
-    .webfusion a:link    { text-decoration:none; font-weight:bold; color: #fff; }
-    .webfusion a:visited { text-decoration:none; font-weight:bold; color: #fff; }
-    .webfusion a:hover   { text-decoration:none; font-weight:bold; color: #fff; }
-    .webfusion a:active  { text-decoration:underline; font-weight:bold; color: #fff; }
-    .webfusion img { vertical-align: middle; }
-  </style>
-  <div class="webfusion"><i>This site is gratefully hosted on a <a href="http://www.webfusion.co.uk/dedicated-servers/">Dedicated Server</a>, sponsored by <a alt="Webfusion" href="http://www.webfusion.co.uk">Webfusion<!--<img src="http://www.webfusion.co.uk/library/images/logo.png"/>--></a></i></div>
-EOF
-}
-
 print <<EOF;
   <div>
    <span class="sml"><a href="?prefs=1">Change Preferences</a></span>
   </div>
   <div>
-   <a href="http://github.com/eserte/cpan-testers-matrix">cpantestersmatrix.pl</a> $VERSION
+   <a href="https://github.com/eserte/cpan-testers-matrix">cpantestersmatrix.pl</a> $VERSION
+   <span class="sml">(mode @{[ $app_mode == APP_MODE_LOGTXT ? "log.txt" : $app_mode == APP_MODE_NDJSONAPI ? "ndjson API" : "regular" ]})</span>
    by <a href="https://metacpan.org/author/SREZIC">Slaven Rezi&#x0107;</a>
-  </div>$sponsor_blurb
+  </div>
 @{[ defined &Botchecker::zdjela_meda ? Botchecker::zdjela_meda() : '' ]}
+@{[ $ENV{BOTCHECKER_JS_ENABLED} && defined &Botchecker_js::remove_r_snippet ? Botchecker_js::remove_r_snippet() : '' ]}
  </body>
 </html>
 EOF
@@ -951,9 +974,9 @@ sub fetch_data ($) {
     if ($dist =~ m{::}) {
 	my $resolve_module_to_dist_sub = sub {
 	    my $cpan_home = get_config("cpan_home");
-	    die "cpan_home not configued in $config_yml" if !$cpan_home;
+	    die "cpan_home not configured in $config_yml" if !$cpan_home;
 	    my $plain_packages_file = get_config("plain_packages_file");
-	    die "plain_packages_file not configued in $config_yml" if !$plain_packages_file;
+	    die "plain_packages_file not configured in $config_yml" if !$plain_packages_file;
 	    my $packages_file = "$cpan_home/sources/modules/02packages.details.txt.gz";
 	    die "$packages_file not readable" if !-r $packages_file;
 	    require Parse::CPAN::Packages::Fast;
@@ -1004,24 +1027,70 @@ EOF
 	    if ($dist =~ m{/}) {
 		die "Invalid distribution name";
 	    }
-	    $url = "file://$static_dist_dir/$dist." . FILEFMT_DIST;
+	    ($dist) = $dist =~ m{(.*)}; # untaint
+	    $url = "file://$static_dist_dir/$dist." . $filefmt_dist;
 	} else {
-	    $url = "http://$ct_domain/show/$dist." . FILEFMT_DIST;
+	    $url = "http://$ct_domain/show/$dist." . $filefmt_dist;
 	}
 
-	my $fetch_dist_data = sub {
-	    my($dist) = @_;
-	    my $req = HTTP::Request->new('GET', $url);
-	    if (USE_IF_MODIFIED_SINCE && $url =~ m{^http}) {
-		if (!$ENV{HTTP_CACHE_CONTROL} || $ENV{HTTP_CACHE_CONTROL} ne 'no-cache') {
-		    if (my $mtime = (stat($cachefile))[9]) {
-			$req->if_modified_since($mtime);
+	my $fetch_dist_data;
+	if ($ndjson_append_url) {
+	    require File::ReadBackwards;
+	    $fetch_dist_data = sub {
+		{
+		    # append data (maybe)
+		    my $ndjson_file = "$static_dist_dir/$dist.$filefmt_dist";
+		    my $last_guid;
+		    if (-e $ndjson_file) {
+			my $bw = File::ReadBackwards->new($ndjson_file)
+			    or die "Can't open $ndjson_file: $!";
+			my $last_line = $bw->readline;
+			my $last_json = JSON::XS::decode_json($last_line);
+			$last_guid = $last_json->{guid};
+			if (!defined $last_guid) {
+			    die "Unexpected: No guid defined in '$last_line' in '$ndjson_file'";
+			}
+		    }
+		    my $qq = CGI->new("");
+		    $qq->param(dist => $dist);
+		    my $url = $ndjson_append_url . "?" . $qq->query_string;
+		    if ($last_guid) {
+			$url .= "&after=$last_guid";
+		    }
+		    my $resp = $ua->get($url);
+		    if ($resp->is_success) {
+			if ($resp->content_length > 0) {
+			    open my $ofh, '>>', $ndjson_file
+				or die "Can't append to $ndjson_file: $!";
+			    for my $line (split /\n/, $resp->decoded_content(charset => 'none')) {
+				JSON::XS::decode_json($line); # just to make sure we're writing complete json lines --- would throw an uncontrolled exception otherwise
+				print $ofh $line, "\n";
+			    }
+			    close $ofh
+				or die $!;
+			}
+		    } else {
+			die "Fetching '$url' failed: " . $resp->dump;
 		    }
 		}
-	    }
-	    my $resp = $ua->request($req);
-	    $resp;
-	};
+		my $resp = $ua->get($url);
+		$resp;
+	    };
+	} else {
+	    $fetch_dist_data = sub {
+		my($dist) = @_;
+		my $req = HTTP::Request->new('GET', $url);
+		if (USE_IF_MODIFIED_SINCE && $url =~ m{^http}) {
+		    if (!$ENV{HTTP_CACHE_CONTROL} || $ENV{HTTP_CACHE_CONTROL} ne 'no-cache') {
+			if (my $mtime = (stat($cachefile))[9]) {
+			    $req->if_modified_since($mtime);
+			}
+		    }
+		}
+		my $resp = $ua->request($req);
+		$resp;
+	    };
+	}
 
 	$resp = $fetch_dist_data->($dist);
 	last GET_DATA if $resp->is_success;
@@ -1067,10 +1136,10 @@ EOF
 	$do_cache_retrieve->();
     } elsif ($resp && $resp->is_success) {
 	eval {
-	    $data = deserialize_dist($resp->decoded_content)
+	    $data = deserialize_dist($resp->decoded_content(charset => 'none'))
 	};
 	if ($@ || !$data) {
-	    my $msg = "Could not load " . (FILEFMT_DIST eq 'yaml' ? 'YAML' : 'JSON') . " data from <$url>";
+	    my $msg = "Could not load " . uc($filefmt_dist) . " data from <$url>";
 	    no warnings 'uninitialized'; # $@ may be undef
 	    warn "$msg. Error: '$@'";
 	    if (-r $cachefile) {
@@ -1137,7 +1206,7 @@ sub fetch_author_data ($) {
 	require CPAN::DistnameInfo;
 
 	my $ua = get_ua;
-	$url = "http://$new_ct_domain/author/$author." . FILEFMT_AUTHOR;
+	$url = "http://$new_ct_domain/author/$author." . $filefmt_author;
 
 	# check first if the file is too large XXX should not be necessary :-(
 	my $head_resp = $ua->head($url);
@@ -1180,7 +1249,7 @@ EOF
 	    or die "Could not load cached data";
     } elsif ($resp && $resp->is_success) {
 	require_deserializer_author;
-	my $data = deserialize_author($resp->decoded_content);
+	my $data = deserialize_author($resp->decoded_content(charset => 'none'));
 	for my $result (@$data) {
 	    my $dist;
 	    if (defined $result->{dist}) { # new style
@@ -1234,9 +1303,11 @@ sub build_success_table ($$$) {
 	$perl_patches{$perl}->{$patch}++ if $patch;
 	my $osname = $r->{osname};
 	if (!defined $osname) {
-	    our %warned_undefined_osname;
-	    if (!$warned_undefined_osname{$dist}++) {
-		warn "Undefined osname in report(s) for $dist";
+	    if (!$r->{fulldate} || $r->{fulldate} ge '2024') { # in the past, there were probably bugs with the reporting tools, causing in undefined osname; do not warn about them
+		our %warned_undefined_osname;
+		if (!$warned_undefined_osname{$dist}++) {
+		    warn "Undefined osname in report(s) for $dist";
+		}
 	    }
 	    $osname = '';
 	}
@@ -1285,8 +1356,9 @@ sub build_success_table ($$$) {
     my @matrix;
     my %acts_per_perl; # perl -> act -> count
     my %acts_per_osname; # osname -> act -> count
+    my $excluded_old_devel;
     for my $perl (@perls) {
-	next if $prefs{exclude_old_devel} && is_old_devel_perl($perl);
+	do { $excluded_old_devel = 1; next } if $prefs{exclude_old_devel} && is_old_devel_perl($perl);
 	my @row;
 	for my $osname (@osnames) {
 	    my $acts = $action{$perl}->{$osname};
@@ -1347,7 +1419,7 @@ sub build_success_table ($$$) {
     }
 
     my $title = "$dist $dist_version";
-    my $ct_link = "http://$ct_domain/show/$dist.html#$dist-$dist_version";
+    my $ct_link = "https://$ct_domain/show/$dist.html#$dist-$dist_version";
 
     return { table => $table,
 	     title => "$dist $dist_version",
@@ -1355,7 +1427,8 @@ sub build_success_table ($$$) {
 	     first_report_date => $first_report_date,
 	     last_report_date => $last_report_date,
 	     total_actions => \%total_actions,
-	     total_configurations => sum map { scalar values %$_ } values %action,
+	     total_configurations => (sum map { scalar values %$_ } values %action),
+	     excluded_old_devel => $excluded_old_devel,
 	   };
 }
 
@@ -1457,7 +1530,7 @@ sub build_maxver_table ($$) {
 
     return { table => $table,
 	     title => "$dist (max version with a PASS)",
-	     ct_link => "http://$ct_domain/show/$dist.html",
+	     ct_link => "https://$ct_domain/show/$dist.html",
 	   };
 }
 
@@ -1477,7 +1550,7 @@ sub build_author_table ($$) {
     }
     return { tables => \@tables,
 	     title => $author,
-	     ct_link => "http://$ct_domain/author/$author.html",
+	     ct_link => "https://$ct_domain/author/$author.html",
 	   };
 }
 
@@ -1591,15 +1664,27 @@ EOF
 	    $msg = <<EOF;
 Cannot fetch data from $ct_domain (site is currently in maintenance)
 As a fallback you can try the alternative
-<http://fast-matrix.cpantesters.org/?@{[ $q->query_string ]}>
+<https://fast-matrix.cpantesters.org/?@{[ $q->query_string ]}>
 EOF
 	} else {
+	    my $first_line;
+	    my @additional_msgs;
+	    my $request_uri = eval { $resp->request->uri };
+	    if ($request_uri =~ m{^file:.*/([^/]+)$}) {
+		$first_line = "File $1 not found on local system.";
+		push @additional_msgs, "Maybe the system did not fetch the reports data for this distribution (may happen for old distributions)?";
+	    } else {
+		$first_line = "Cannot fetch data from $ct_domain (file not found)";
+	    }
 	    $msg = <<EOF;
-Cannot fetch data from $ct_domain (file not found)
+$first_line
 
 Maybe you mistyped the distribution name?
 Maybe you added the author name to the distribution string?
 Maybe the distribution is very fresh and not yet available at CPAN Testers?
+EOF
+	    $msg .= join("", map { "$_\n" } @additional_msgs);
+	    $msg .= <<EOF;
 Note that the distribution name is case-sensitive.
 EOF
 	}
@@ -1780,7 +1865,7 @@ sub dist_links {
 <li><a href="http://deps.cpantesters.org/?module=@{[ CGI::escapeHTML($faked_module) ]}">CPAN Dependencies</a>
 <li><a href="http://deps.cpantesters.org/depended-on-by.pl?dist=$dist_html">Reverse deps</a>
 <li><a href="$ct_link">CPAN Testers</a>
-<li><a href="https://metacpan.org/release/$dist_html">metacpan.org</a> (<a href="http://search.cpan.org/dist/$dist_html/">alternative</a>)
+<li><a href="https://metacpan.org/release/$dist_html">metacpan.org</a> (<a href="https://search.cpan.org/dist/$dist_html/">alternative</a>)
 <li><a href="@{[ CGI::escapeHTML($dist_bugtracker_url) ]}">Bugtracker</a>
 EOF
     if (SHOW_ANALYSIS_LINK && defined $dist_version) {
@@ -1795,13 +1880,33 @@ EOF
 <li><a href="https://build.opensuse.org/package/show/devel:languages:perl:CPAN-$first_letter/perl-$dist_html">SUSE Open Build System</a> @{[ beta_html ]}
 EOF
     }
-    if ($is_log_txt_view) { # we're on the log.txt view, show link back
+    if ($app_mode != APP_MODE_REGULAR) {
 	print <<EOF;
-<li><a class="sml" href="http://matrix.cpantesters.org/?@{[ CGI::escapeHTML($q->query_string) ]}">Regular matrix</a> <span class="sml"></span>
+<li><a class="sml" href="https://matrix.cpantesters.org/?@{[ CGI::escapeHTML($q->query_string) ]}">Regular matrix</a> <span class="sml"></span>
 EOF
-    } else {
+    }
+    if ($app_mode != APP_MODE_LOGTXT) {
 	print <<EOF;
-<li><a class="sml" href="http://fast-matrix.cpantesters.org/?@{[ CGI::escapeHTML($q->query_string) ]}">Matrix via log.txt</a> <!--<span class="sml">(temporary!)</span>-->
+<li><a class="sml" href="https://fast-matrix.cpantesters.org/?@{[ CGI::escapeHTML($q->query_string) ]}">Matrix via log.txt ("fast")</a> <!--<span class="sml">(temporary!)</span>-->
+EOF
+    }
+    if ($app_mode != APP_MODE_NDJSONAPI) {
+	print <<EOF;
+<li><a class="sml" href="https://fast2-matrix.cpantesters.org/?@{[ CGI::escapeHTML($q->query_string) ]}">Matrix via ndjson API ("fast2")</a> <!--<span class="sml">(temporary!)</span>-->
+EOF
+    }
+    if (1) {
+	my $dist_version_part = '';
+	if (defined $dist_version) {
+	    $dist_version_part = '/' . CGI::escapeHTML($dist_version);
+	}
+	print <<EOF;
+<li><a class="sml" href="https://matrix.perl-magpie.org/dist/$dist_html$dist_version_part">Matrix at perl-magpie</a>
+EOF
+    }
+    if (1) {
+	print <<EOF;
+<li><script type="text/javascript">add_json_download_link("$dist")</script> <!--<span class="sml">(temporary!)</span>-->
 EOF
     }
     print <<EOF;
@@ -1827,14 +1932,15 @@ EOF
 	}
 
 	my $val = $config->{$key};
-	no warnings 'uninitialized';
+	return $val if !defined $val;
 	($val) = $val =~ m{^(.*)$}; # we trust everything here
 	$val;
     }
 }
 
 sub get_amendments {
-    my $amendments = {};
+    my $amendments = { by_id => {}, by_distver => {} };
+    my $amendments_by_distver = {};
     eval {
 	if (-r $amendments_st && -s $amendments_st && -M $amendments_st < -M $amendments_yml) {
 	    $amendments = cache_retrieve $amendments_st;
@@ -1842,8 +1948,14 @@ sub get_amendments {
 	    require_yaml;
 	    my $raw_amendments = yaml_load_file($amendments_yml);
 	    for my $amendment (@{ $raw_amendments->{amendments} }) {
-		for my $id (@{ $amendment->{id} }) {
-		    $amendments->{$id} = $amendment;
+		if ($amendment->{id}) {
+		    for my $id (@{ $amendment->{id} }) {
+			$amendments->{by_id}{$id} = $amendment;
+		    }
+		} elsif ($amendment->{distver}) {
+		    for my $distver (@{ $amendment->{distver} }) {
+			$amendments->{by_distver}{$distver} = $amendment;
+		    }
 		}
 	    }
 	    cache_store $amendments, $amendments_st;
@@ -1861,10 +1973,12 @@ sub amend_result {
     # Formerly it was called 'action', now it is 'status' (and there's
     # a 'state', which is lowercase)
     $result->{action} = $result->{status} if !exists $result->{action};
-    # May happen in author YAML/JSONs --- inconsistency!
-    $result->{action} = $result->{state}  if !defined $result->{action};
+    # May happen in author YAML/JSONs; also used in ndjson_append_url (here: lowercase)
+    $result->{action} = uc $result->{state}  if !defined $result->{action};
     # Another one: 'archname' is now 'platform'
     $result->{archname} = $result->{platform} if !exists $result->{archname};
+    # dist vs distribution (seen in ndjson_append_url output)
+    $result->{distribution} = $result->{dist} if !exists $result->{distribution};
 
     ## Happens after 2011-10 (again?); deactivated 2013; reactivated 2017-08
     ## canonify perl version: strip leading "v"
@@ -1883,14 +1997,25 @@ sub amend_result {
     $result->{fulldate} =~ s{^(....)(..)(..)(..)(..)$}{$1-$2-$3 $4:$5} if exists $result->{fulldate};
     $result->{tester} = obfuscate_from $result->{tester};
 
-    my $id = $result->{id};
     my $action_comment;
     $amendments ||= get_amendments();
-    if (defined $id && $amendments && exists $amendments->{$id}) {
-	if (my $new_action = $amendments->{$id}->{action}) {
-	    $result->{action} = $new_action;
+    if ($amendments) {
+	my $amendment;
+	my $id = $result->{id};
+	if (defined $id && exists $amendments->{by_id}{$id}) {
+	    $amendment = $amendments->{by_id}{$id};
+	} else {
+	    my $distver = defined $result->{dist} && defined $result->{version} ? $result->{dist} . '-' . $result->{version} : undef;
+	    if (defined $distver && exists $amendments->{by_distver}{$distver}) {
+		$amendment = $amendments->{by_distver}{$distver};
+	    }
 	}
-	$result->{action_comment} = $amendments->{$id}->{comment};
+	if ($amendment) {
+	    if (my $new_action = $amendment->{action}) {
+		$result->{action} = $new_action;
+	    }
+	    $result->{action_comment} = $amendment->{comment};
+	}
     }
 }
 
@@ -1947,9 +2072,12 @@ sub is_old_devel_perl {
 }
 
 sub require_deserializer_dist () {
-    if (FILEFMT_DIST eq 'json') {
+    if ($filefmt_dist eq 'json') {
 	require_json;
 	*deserialize_dist      = \*json_load;
+    } elsif ($filefmt_dist eq 'ndjson') {
+	require_ndjson;
+	*deserialize_dist      = \*ndjson_load;
     } else {
 	require_yaml;
 	*deserialize_dist      = \*yaml_load;
@@ -1957,9 +2085,12 @@ sub require_deserializer_dist () {
 }
 
 sub require_deserializer_author () {
-    if (FILEFMT_AUTHOR eq 'json') {
+    if ($filefmt_author eq 'json') {
 	require_json;
 	*deserialize_author      = \*json_load;
+    } elsif ($filefmt_author eq 'ndjson') {
+	require_ndjson;
+	*deserialize_dist        = \*ndjson_load;
     } else {
 	require_yaml;
 	*deserialize_author      = \*yaml_load;
@@ -1990,11 +2121,33 @@ sub require_json () {
     };
 }
 
+sub require_ndjson () {
+    require JSON::XS;
+    no warnings 'once';
+    *ndjson_load      = sub {
+	my @data;
+	my $line_number = 0;
+	for my $line (split /\n/, $_[0]) {
+	    $line_number++;
+	    push @data, eval { JSON::XS::decode_json($line) };
+	    if ($@) {
+		my $msg = $@;
+		$msg =~ s{(.*) (at )}{$1 (ndjson line $line_number) $2};
+		die "$msg\n";
+	    }
+	}
+	\@data;
+    };
+    *ndjson_load_file = sub {
+	die "ndjson_load_file is NYI"; # XXX is this used anywhere?
+    };
+}
+
 sub beta_html () {
     q{<span style="font-size:5pt; font-family: sans-serif; border:1px solid red; padding:0px 2px 0px 2px; background-color:yellow; color:black;">BETA</span>};
 }
 
-# Taken CPAN/Blame/Model/Solved.pm from git://repo.or.cz/andk-cpan-tools.git
+# Originally taken from CPAN/Blame/Model/Solved.pm from git://repo.or.cz/andk-cpan-tools.git (and tweaked a little bit)
 sub obfuscate_from ($) {
     my $from = shift;
     my $obfuscated_from = $from;
@@ -2003,6 +2156,7 @@ sub obfuscate_from ($) {
 	return $from_to_obfuscated{$from} if exists $from_to_obfuscated{$from};
 
 	for ($obfuscated_from) {
+	    s/^""\s+<(.*)>/$1/; # handle empty name, something like: "" <user@domain>
 	    s/\s+\(\(root|Charlie &\)\)$//; # "root" is meaningless, strip it
 	    s/.+\(([^\)]+)\).*/$1/;
 	    last if s/.*\(\"([^"]+)\"\)/$1/;
@@ -2059,9 +2213,10 @@ sub cache_retrieve ($) {
 
 sub downtime_teaser () {
     my @downtimes = (
-		     [1374012000, 1374033600], # 2013-07-17T06:00:00 CEST - 2013-07-17T00:00:00 CEST
-		     [1374098400, 1374120000], # 2013-07-18T06:00:00 CEST - 2013-07-18T00:00:00 CEST
-		     [1374616800, 1374638400], # 2013-07-24T06:00:00 CEST - 2013-07-24T00:00:00 CEST
+		     #[1374012000, 1374033600], # 2013-07-17T06:00:00 CEST - 2013-07-17T00:00:00 CEST
+		     #[1374098400, 1374120000], # 2013-07-18T06:00:00 CEST - 2013-07-18T00:00:00 CEST
+		     #[1374616800, 1374638400], # 2013-07-24T06:00:00 CEST - 2013-07-24T00:00:00 CEST
+		     [1727848800, 1727935200], # 2024-10-02 08:00:00 CEST - 2024-10-03 08:00:00 CEST
 		    );
     my @active_downtimes = grep { $_->[1] >= time } @downtimes;
     return if !@active_downtimes;
@@ -2101,6 +2256,14 @@ sub _reusing_cache_msg ($) {
     my $cachefile = shift;
     my $days = -M $cachefile;
     sprintf "\nReusing old cached file, %.1f day%s old\n", $days, $days != 1 ? 's' : '';
+}
+
+sub excluded_old_devel_notice {
+    print <<EOF;
+<div style="margin-bottom:0.5cm; font-size:smaller; ">
+<b>Note</b>: results for old devel perls were excluded by preference (current stable perl: $current_stable_perl).
+</div>
+EOF
 }
 
 {
@@ -2188,7 +2351,7 @@ Contributions by: Florian Ragwitz and Sebastien Aperghis-Tramoni
 
 =head1 SEE ALSO
 
-L<http://deps.cpantesters.org/>,
-L<http://www.cpantesters.org/>
+L<https://deps.cpantesters.org/>,
+L<https://www.cpantesters.org/>
 
 =cut

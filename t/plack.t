@@ -63,8 +63,15 @@ test_psgi app => $app, client => sub {
     my $res = $cb->(GET '/robots.txt', @UA);
     ok $res->is_success, "get robots.txt"
 	or diag $res->as_string;
-    like $res->decoded_content, qr{^Disallow: /\?$}m;
-    like $res->decoded_content, qr{^Disallow: /ZDJELAMEDA$}m;
+    is $res->decoded_content, <<EOF;
+User-agent: *
+Disallow: /
+EOF
+
+    {
+	my $res = $cb->(GET '/not-found', @UA);
+	is $res->code, 404, '404 as expected';
+    }
 };
 
 __END__

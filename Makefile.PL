@@ -76,6 +76,7 @@ fix-permissions-data-debian:
 	sudo chmod g+w data
 
 BOTCHECKER=	${SRCROOT}/botchecker/Botchecker.pm
+BOTCHECKER_JS=	${SRCROOT}/botchecker/Botchecker_js.pm
 
 EOF
 
@@ -122,15 +123,18 @@ rsync-$type-cpantestersmatrix:	rsync-$type-cpantestersmatrix-beta rsync-$type-cp
 
 rsync-$type-cpantestersmatrix-beta:
 	perl -c \${BOTCHECKER}
-	rsync -av \${BOTCHECKER} $host:$wwwroot/cpan-testers-matrix.beta/cgi-bin/
+	perl -c \${BOTCHECKER_JS}
+	rsync -av \${BOTCHECKER} \${BOTCHECKER_JS} $host:$wwwroot/cpan-testers-matrix.beta/cgi-bin/
 
 rsync-$type-cpantestersmatrix-fast:
 	perl -c \${BOTCHECKER}
-	rsync -av \${BOTCHECKER} $host:$wwwroot/cpan-testers-matrix.fast/cgi-bin/
+	perl -c \${BOTCHECKER_JS}
+	rsync -av \${BOTCHECKER} \${BOTCHECKER_JS} $host:$wwwroot/cpan-testers-matrix.fast/cgi-bin/
 
 rsync-$type-cpantestersmatrix-stable:
 	perl -c \${BOTCHECKER}
-	rsync -av \${BOTCHECKER} $host:$wwwroot/cpan-testers-matrix/cgi-bin/
+	perl -c \${BOTCHECKER_JS}
+	rsync -av \${BOTCHECKER} \${BOTCHECKER_JS} $host:$wwwroot/cpan-testers-matrix/cgi-bin/
 
 fix-$type-cpantestersmatrix-permissions:
 	ssh $host chgrp www-data $wwwroot/cpantestersmatrix
@@ -139,39 +143,13 @@ fix-$type-cpantestersmatrix-permissions:
 EOF
     }
 
-    if (defined $ENV{USER} && $ENV{USER} eq 'eserte') {
-	if ($^O =~ /bsd/i) { # assume BSD make
-	    $postamble .= <<'EOF';
-GIT_TAG_DATE=	$(shell date +%Y%m%d)
-EOF
-	} else { # assume GNU make
-	    $postamble .= <<'EOF';
-GIT_TAG_DATE!=	date +%Y%m%d
-EOF
-	}
-	$postamble .= <<'EOF';
-GIT_TAG=	deployment/bbbikede/${GIT_TAG_DATE}
-
+    $postamble .= <<'EOF';
 git-post-tasks:
-	git diff-index --quiet --cached HEAD
-	git diff-files --quiet || (\
-	    echo "There are uncommitted changes"; \
-	    git diff-files; \
-	    false; \
-	)
-	test -z "$$(git ls-files --exclude-standard --others)" || (\
-	    echo "There are untracked files"; \
-	    git ls-files --exclude-standard --others; \
-	    false; \
-	)
-	$(NOECHO) echo -n "This will tag version $(GIT_TAG) and push the default branch and the current tag. OK? "
+	$(NOECHO) echo -n "This will tag and push. OK? "
 	$(NOECHO) read yn
-	git tag -a -m "* $(GIT_TAG)" $(GIT_TAG) || (echo "If setting this tag fails, then try using a suffix e.g. _2"; false)
-	git push
-	git push origin $(GIT_TAG)
+	bin/git-post-tasks-doit.pl
 
 EOF
-    }
 
     $postamble;
 }

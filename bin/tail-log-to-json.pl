@@ -4,12 +4,11 @@
 #
 # Author: Slaven Rezic
 #
-# Copyright (C) 2012,2015,2016,2020 Slaven Rezic. All rights reserved.
+# Copyright (C) 2012,2015,2016,2020,2025 Slaven Rezic. All rights reserved.
 # This program is free software; you can redistribute it and/or
 # modify it under the same terms as Perl itself.
 #
-# Mail: slaven@rezic.de
-# WWW:  http://www.rezic.de/eserte/
+# WWW:  https://github.com/eserte/cpan-testers-matrix
 #
 
 use strict;
@@ -112,7 +111,7 @@ while(<$fh>) {
 	# - version
 	# - dist
 	my $osname;
-	if ($archname =~ m{\b(linux|openbsd|netbsd|solaris|freebsd|MSWin32|darwin|dragonfly|cygwin|mirbsd|gnukfreebsd|haiku|bitrig|android)\b}) {
+	if ($archname =~ m{\b(linux|openbsd|netbsd|midnightbsd|solaris|freebsd|MSWin32|darwin|dragonfly|cygwin|mirbsd|gnukfreebsd|haiku|bitrig|android|nto)\b}) {
 	    $osname = lc $1
 	} else {
 	    warn "Cannot parse OS out of '$archname'\n";
@@ -128,7 +127,7 @@ while(<$fh>) {
 	# example: AVENJ/MooX-Role-Pluggable-0.01.tar.gz
 	# XXX use DistnameInfo or so?
 	if (my($dist, $version) = $distpath =~ m{^.+/(.*)-v?(\d.*)\.(?:tar\.gz|zip|tar\.bz2|tgz)$}) {
-	    push @{ $distinfo{$dist} }, {
+	    unshift @{ $distinfo{$dist} }, {
 					 status => uc($status),
 					 osname => $osname,
 					 ## XXX There are two GUIDs: the GUIDs defined in log.txt
@@ -159,7 +158,7 @@ $status->{tell} = tell $fh;
 close $fh;
 
 while(my($dist,$v) = each %distinfo) {
-    if ($dist !~ m{^[a-zA-Z0-9_-]+$}) {
+    if ($dist !~ m{^[a-zA-Z0-9_+-]+$}) {
 	warn "Skipping possibly problematic filename '$dist'...\n";
     } else {
 	my $o_file = $o_dir . "/$dist.json";
